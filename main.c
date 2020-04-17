@@ -156,6 +156,39 @@ hdf5_write_superblock(struct hdf5_file *h5)
     fwrite(&undef, sizeof(undef), 1, h5->file); // Driver Information Block Address (always undefined)
 }
 
+void
+hdf5_initialize_root_structures(struct hdf5_file *h5)
+{
+    // REDO - Don't Hardcode stuff
+    uint64_t link_name_offset = 0;
+    uint64_t obj_header_addr  = ftell(h5->file) + 40;
+    uint32_t cache_type = 1;
+    uint32_t reserved   = 0;
+    uint64_t b_tree_loc = obj_header_addr; // + todo
+    uint64_t heap_loc   = b_tree_loc + 0x18 + (1 + 4*h5->super_block->int_node_k)*8; //todo: check this
+    uint8_t obj_ver = 1;
+    uint8_t u8_0 = 0;
+    uint16_t num_msg = 1;
+    uint32_t obj_ref_count = 1;
+    uint32_t obj_header_size = 0x18; // todo: check this
+    uint16_t msg_type = 0x11;
+    uint16_t msg_sz = 0x10;
+    uint32_t flags_and_pad = 0;
+    // Write root symbol table entry
+    fwrite(&link_name_offset, sizeof(link_name_offset), 1, h5->file);
+    fwrite(&obj_header_addr, sizeof(obj_header_addr), 1, h5->file);
+    fwrite(&cache_type, sizeof(cache_type), 1, h5->file);
+    fwrite(&reserved, sizeof(reserved), 1, h5->file);
+    fwrite(&b_tree_loc, sizeof(b_tree_loc), 1, h5->file);
+    fwrite(&heap_loc, sizeof(heap_loc), 1, h5->file);
+    // write root object
+    fwrite(&obj_ver, sizeof(&obj_ver), 1, h5->file);
+    fwrite(&u8_0, sizeof(u8_0), 1, h5->file);
+    fwrite(
+    // write root b-tree with zeros
+    
+}
+
 struct hdf5_file *
 hdf5_file_create(const char *fname, uint16_t leaf, uint16_t inter)
 {
@@ -204,9 +237,9 @@ int main(void)
     double b   = 1;
     uint64_t c = 0xdeadbeefdeadbeef;
     hdf5_var_push(h5, (void *)&a, "a", INT32);
-    hdf5_var_push(h5, (void *)&b, "b", DOUBLE);
-    hdf5_var_push(h5, (void *)&c, "c", UINT64);
-    
+    //hdf5_var_push(h5, (void *)&b, "b", DOUBLE);
+    //hdf5_var_push(h5, (void *)&c, "c", UINT64);
+    hdf5_write_vars(h5);
     hdf5_file_end(&h5);
     return 0;
 }
