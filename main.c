@@ -16,6 +16,7 @@ struct hdf5 {
     struct {
         size_t file_offset, eof_loc;
     } super_block;
+    struct group *root_group;
 };
 
 struct buffer *
@@ -72,7 +73,7 @@ buffer_write(struct buffer *b, const void *ptr, size_t size)
 }
 
 int
-buffer_transfer(struct buffer *dst, struct beffer *src)
+buffer_transfer(struct buffer *dst, struct buffer *src)
 {
     int out = buffer_write(dst, src->buffer, src->count);
     if (out == ENOMEM)
@@ -104,6 +105,20 @@ file_and_buffer_tell(struct hdf5 *h5)
 {
     return (buffer_tell(h5->buf) + ftell(h5->out));
 }
+
+void
+file_shift(FILE *fid, uint64_t start, uint64_t amt)
+{
+    fseek(fid, 0, SEEK_END);
+    size_t total = ftell(fid) - start;
+    char buffer[total];
+    fseek(fid, start, SEEK_SET);
+    fread(buffer, total, 1, fid);
+    fseek(fid, start+amt, SEEK_SET);
+    fwrite(buffer, total, 1, fid);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////
 
 const char *MAT_HEADER =
     "MATLAB 7.3 MAT-file, "
@@ -193,27 +208,42 @@ hdf5_create(FILE *outfile)
     return out;
 }
 
-struct message {
-    uint16_t msg_type;
-    struct buffer *buf;
+struct var {
+    size_t len_name, heap_off, obj_loc;
 };
 
 struct group {
-    uint16_t num_obj_msg;
-    struct message *msg;
+    uint64_t b_tree_begin;
+    uint64_t heap_begin, heap_end, heap_p;
+    size_t size, count;
+    struct var **var;
 };
+
+struct var *
+var_create(size_t len, size_t off)
+{
+    struct var *out = malloc(sizeof(*out));
+    out->len_name = len;
+    out->heap_off = off;
+    return out;
+}
+
+void
+var_destroy(struct var **v)
+{
+    free(*v);
+    *v = NULL;
+}
 
 void
 group_load(struct group *g, unsigned type)
 {
     switch (type) {
     default: //case 0:
-        g->num_obj_msg = 1;
-        g->msg = malloc(sizeof(g->msg[0]));
-        g->msg->msg_type = 0x0011;
-        g->msg->buf = buffer_create();
-        buffer_write(g->msg->buf, &ROOT_BTREE, sizeof(ROOT_BTREE));
-        buffer_write(g->msg->buf, &ROOT_HEAP, sizeof(ROOT_HEAP));
+        g->b_tree_begin = ROOT_BTREE;
+        g->heap_begin   = ROOT_HEAP;
+        g->heap_end     = ROOT_HEAP + 0x78;
+        g->heap_p       = ROOT_HEAP + 0x28;
         break;
     }
 }
@@ -224,40 +254,178 @@ group_create(unsigned type)
     // type will determine components of group
     struct group *out = malloc(sizeof(*out));
     group_load(out, type);
+    out->size  = 4;
+    out->count = 0;
+    out->var   = malloc(out->size * sizeof(out->var[0]));
     return out;
 }
 
 void
-hdf5_group_push(struct hdf5 *h5, struct group *g)
+group_destroy(struct group **g)
 {
-    // Objects
-    //   Header
-    //     Num messages and overall size of whole object determined a posteriori
-    // B-Trees
-    //   Top node should be formed with blank values and filled in at the end
-    // Heaps
-    //   Should be formed as new variables come in
-    // Symbol Node and/or data
-    // Symbol Table Entries
-    //   Offset into heap
-    //   Object header loc
-    //   Cache type  - probably either 0 or 1
-    //   Scratch Pad - probably either blank or addr of b-tree and heap
+    for (size_t i = 0; i < (*g)->count; i++)
+        var_destroy(&(*g)->var[i]);
+    free((*g)->var);
+    free(*g);
+    *g = NULL;
+}
+
+void
+group_var_push(struct group *g, struct var *v)
+{
+    if (g->count == g->size) {
+        g->size *= 2;
+        g->var   = realloc(g->var, g->size * sizeof(g->var[0]));
+    }
+    g->var[g->count] = v;
+    g->count++;
+}
+
+void
+hdf5_buffer_fill_object_header(struct hdf5 *h5, uint16_t num_msg, uint64_t hdr_size)
+{
+    uint8_t obj_ver   = 1;
+    uint32_t ref_cnt  = 1;
+    buffer_write(h5->buf, &obj_ver,  1);
+    buffer_write(h5->buf, &RES_8,    1);
+    buffer_write(h5->buf, &num_msg,  2);
+    buffer_write(h5->buf, &ref_cnt,  4);
+    buffer_write(h5->buf, &hdr_size, 8);
+}
+
+void
+hdf5_buffer_message_0x05(struct hdf5 *h5)
+{
+    // This message has to exist, but it's always the same
+    uint64_t first  = 0x0000000100070001;
+    uint64_t second = 0x0000000001020102;
+    buffer_write(h5->buf, &first,  8);
+    buffer_write(h5->buf, &second, 8);
+}
+
+void
+hdf5_root_group(struct hdf5 *h5)
+{
+    struct group *g = group_create(0);
+    g->b_tree_begin += h5->super_block.file_offset;
+    g->heap_begin   += h5->super_block.file_offset;
+    g->heap_end     += h5->super_block.file_offset;
+    g->heap_p       += h5->super_block.file_offset;
+
+    // Object header and message for root group
+    uint16_t num_msg  = 1;
+    uint64_t hdr_size = 0x0000000000000018;
+    uint16_t msg_type = 0x0011;
+    uint16_t msg_size = 0x0010;
+    uint32_t flags    = 0x00000000;
+    hdf5_buffer_fill_object_header(h5, num_msg, hdr_size);
+    buffer_write(h5->buf, &msg_type, 2);
+    buffer_write(h5->buf, &msg_size, 2);
+    buffer_write(h5->buf, &flags,    4);
+    buffer_write(h5->buf, &ROOT_BTREE, sizeof(ROOT_BTREE));
+    buffer_write(h5->buf, &ROOT_HEAP, sizeof(ROOT_HEAP));
+
+    // Setting up root B-Tree and Heap
+    const char *tree_sig = "TREE";
+    const char *heap_sig = "HEAP";
+    uint8_t node_type  = 0x00;
+    uint8_t node_level = 0x00;   // Denotes a leaf ... could change depending on num_vars
+    uint16_t entries   = 0x0001; // Always this for root
+    uint64_t blank64   = 0x0000000000000000;
+    uint32_t h_ver_res = 0x00000000;
+    uint64_t data_size = g->heap_end - g->heap_begin - 0x20;
+    uint64_t data_beg  = g->heap_begin + 0x20 - h5->super_block.file_offset;
+    buffer_write(h5->buf, tree_sig, strlen(tree_sig));
+    buffer_write(h5->buf, &node_type,  1);
+    buffer_write(h5->buf, &node_level, 1);
+    buffer_write(h5->buf, &entries,    2);
+    buffer_write(h5->buf, &UNDEF,      8);
+    buffer_write(h5->buf, &UNDEF,      8);
+    for (size_t i = 0; i < (1 + 4*INT_K); i++)
+        buffer_write(h5->buf, &blank64, 8); // Blank key and entries
+    buffer_write(h5->buf, heap_sig,   strlen(heap_sig));
+    buffer_write(h5->buf, &h_ver_res, 4);
+    buffer_write(h5->buf, &data_size, 8);
+    buffer_write(h5->buf, &blank64,   8);
+    buffer_write(h5->buf, &data_beg,  8);
+    for (size_t i = 0; i < (data_size / 8); i++)
+        buffer_write(h5->buf, &blank64, 8); // Blank heap
+
+    // Fleshed out Symbol Node and blanked out entries for the symbol table
+    const char *snod_sig = "SNOD";
+    uint16_t snod_ver_res = 0x0001;
+    uint16_t num_syms     = 0x0000;
+    buffer_write(h5->buf, snod_sig, strlen(snod_sig));
+    buffer_write(h5->buf, &snod_ver_res, 2);
+    buffer_write(h5->buf, &num_syms,     2);
+    for (size_t i = 0; i < 5*2*LEAF_K; i++)
+        buffer_write(h5->buf, &blank64, 8);
+    
+    buffer_flush(h5->buf, h5);
+    h5->root_group = g;
 }
 
 void
 hdf5_destroy(struct hdf5 **H)
 {
     struct hdf5 *h5 = *H;
+    if (buffer_tell(h5->buf) > 0)
+        buffer_flush(h5->buf, h5);
+    uint64_t eof_mark = ftell(h5->out);
+    fseek(h5->out, h5->super_block.eof_loc, SEEK_SET);
+    fwrite(&eof_mark, sizeof(eof_mark), 1, h5->out);
+    fclose(h5->out);
     buffer_destroy(&h5->buf);
+    group_destroy(&h5->root_group);
     free(*H);
     *H = NULL;
 }
 
+enum mat_type {miDOUBLE};
+
+void
+hdf5_begin(struct hdf5 *h5, const char *name, enum mat_type type)
+{
+    // write name to heap and store info
+    size_t len_name = strlen(name);
+    struct var *v = var_create(len_name, h5->root_group->heap_p);
+    if (len_name > (h5->root_group->heap_end - h5->root_group->heap_p + 1)) {
+        size_t amt = h5->root_group->heap_end - h5->root_group->heap_begin - 0x20;
+        file_shift(h5->out, h5->root_group->heap_end, amt);
+        h5->root_group->heap_end += amt;
+        for (size_t i = 0; i < h5->root_group->count; i++)
+            h5->root_group->var[i]->obj_loc += amt;
+    }
+    group_var_push(h5->root_group, v);
+    fseek(h5->out, h5->root_group->heap_p, SEEK_SET);
+    fwrite(name, len_name, 1, h5->out);
+    fwrite(&RES_8, 1, 1, h5->out);
+    h5->root_group->heap_p += len_name + 1;
+    while ((h5->root_group->heap_p % 8) != 0) {
+        fwrite(&RES_8, 1, 1, h5->out);
+        h5->root_group->heap_p++;
+    }
+    v->obj_loc = 0x28*(h5->root_group->count - 1) + h5->root_group->heap_end + 0x08;
+
+    // Begin writing object to buffer
+    hdf5_buffer_fill_object_header(h5, 5, UNDEF);
+    hdf5_buffer_message_0x05(h5);
+    // TODO: hdf5_buffer_message_0x03 - need h5, type
+    // TODO: hdf5_buffer_message_0x0C - need h5, type
+}
+
 int main (void)
 {
-    FILE *out = fopen("test.h5", "wb");
+    FILE *out = fopen("data/test.h5", "wb");
     struct hdf5 *h5 = hdf5_create(out);
+    hdf5_root_group(h5);
+    
+    double test_a = 5.7;
+    hdf5_begin(h5, "test_a", miDOUBLE);
+    hdf5_dims(h5, 2, 1, 1);
+    hdf5_data(h5, &test_a);
+    hdf5_end(h5);
+    
     hdf5_destroy(&h5);
     return 0;
 }
