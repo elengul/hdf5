@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,6 +81,14 @@ buffer_transfer(struct buffer *dst, struct buffer *src)
         return out;
     src->count = src->p = 0;
     return 0;
+}
+
+void
+buffer_8byte_align(struct buffer *b)
+{
+    uint8_t align = 0x00;
+    while ((b->count % 8) != 0)
+        buffer_write(b, &align, 1);
 }
 
 void
@@ -209,7 +218,7 @@ hdf5_create(FILE *outfile)
 }
 
 struct var {
-    size_t len_name, heap_off, obj_loc;
+    size_t len_name, heap_off, obj_loc, nmemb, mem_size;
 };
 
 struct group {
@@ -294,16 +303,6 @@ hdf5_buffer_fill_object_header(struct hdf5 *h5, uint16_t num_msg, uint64_t hdr_s
 }
 
 void
-hdf5_buffer_message_0x05(struct hdf5 *h5)
-{
-    // This message has to exist, but it's always the same
-    uint64_t first  = 0x0000000100070001;
-    uint64_t second = 0x0000000001020102;
-    buffer_write(h5->buf, &first,  8);
-    buffer_write(h5->buf, &second, 8);
-}
-
-void
 hdf5_root_group(struct hdf5 *h5)
 {
     struct group *g = group_create(0);
@@ -371,6 +370,10 @@ hdf5_destroy(struct hdf5 **H)
     struct hdf5 *h5 = *H;
     if (buffer_tell(h5->buf) > 0)
         buffer_flush(h5->buf, h5);
+    fseek(h5->out, h5->root_group->heap_end+6, SEEK_SET);
+    uint16_t num_vars = h5->root_group->count;
+    fwrite(&num_vars, 2, 1, h5->out);
+    fseek(h5->out, 0, SEEK_END);
     uint64_t eof_mark = ftell(h5->out);
     fseek(h5->out, h5->super_block.eof_loc, SEEK_SET);
     fwrite(&eof_mark, sizeof(eof_mark), 1, h5->out);
@@ -381,14 +384,116 @@ hdf5_destroy(struct hdf5 **H)
     *H = NULL;
 }
 
-enum mat_type {miDOUBLE};
+enum mat_type {miDOUBLE = 0, miFLOAT};
+
+const size_t SIZES[] = {8, 4};
+
+void
+hdf5_buffer_message_0x05(struct hdf5 *h5)
+{
+    // This message has to exist, but it's always the same
+    uint16_t msg_num = 0x0005;
+    uint16_t size    = 0x0008;
+    uint32_t fnr     = 0x00000001;
+    uint64_t data    = 0x0000000001020102;
+    buffer_write(h5->buf, &msg_num, 2);
+    buffer_write(h5->buf, &size,    2);
+    buffer_write(h5->buf, &fnr,     4);
+    buffer_write(h5->buf, &data,    8);
+}
+
+void
+hdf5_message_0x03_float(struct hdf5 *h5, uint16_t prec)
+{
+    uint16_t msg_num = 0x0003;
+    uint16_t size    = 0x0018;
+    uint32_t fnr     = 0x00000001;
+    uint32_t cls_ver_bits = 0x00000000;
+    uint32_t d_size = prec / 8;
+    cls_ver_bits |= 0x11; // Denotes floating point
+    cls_ver_bits |= 0x2000; // Denotes most sig fig of mantissa not stored, but is set
+    cls_ver_bits |= ((8*d_size - 1) << 16); // Sign bit location
+    uint16_t bit_off  = 0x0000;
+    uint16_t bit_prec = prec;
+    uint8_t mant_loc  = 0x00;
+    uint8_t mant_size = prec == 64 ? 0x34 : 0x17;
+    uint8_t exp_loc   = mant_size;
+    uint8_t exp_size  = prec == 64 ? 0x0B : 0x08;
+    uint32_t exp_bias = prec == 64 ? 0x000003FF : 0x0000007F;
+    buffer_write(h5->buf, &msg_num,      2);
+    buffer_write(h5->buf, &size,         2);
+    buffer_write(h5->buf, &fnr,          4);
+    buffer_write(h5->buf, &cls_ver_bits, 4);
+    buffer_write(h5->buf, &d_size,       4);
+    buffer_write(h5->buf, &bit_off,      2);
+    buffer_write(h5->buf, &bit_prec,     2);
+    buffer_write(h5->buf, &exp_loc,      1);
+    buffer_write(h5->buf, &exp_size,     1);
+    buffer_write(h5->buf, &mant_loc,     1);
+    buffer_write(h5->buf, &mant_size,    1);
+    buffer_write(h5->buf, &exp_bias,     4);
+    buffer_8byte_align(h5->buf);
+}
+
+void
+hdf5_buffer_message_0x03(struct hdf5 *h5, enum mat_type type)
+{
+    switch (type) {
+    case miFLOAT:
+        hdf5_message_0x03_float(h5, 32);
+        break;
+    default: //case miDOUBLE;
+        hdf5_message_0x03_float(h5, 64);
+        break;
+    }
+}
+
+void
+hdf5_buffer_message_0x0C(struct hdf5 *h5, enum mat_type type)
+{
+    uint16_t msg_num   = 0x000C;
+    uint16_t size      = 0xFFFF; //Place holder
+    uint32_t fnr       = 0x00000000;
+    uint8_t ver        = 0x01;
+    uint16_t name_sz   = 0x000D; // Only other observed is MATLAB_fields, which is 0x0E (so must change)
+    uint16_t type_sz   = 0x0008;
+    uint16_t space_sz  = 0x0008;
+    const char *name   = "MATLAB_class";
+    uint32_t type_type = 0x00000013; // denotes string
+    uint32_t type_len  = 0x00000006; // denotes length - hardcoding for double for now
+    uint64_t space     = 1; // Has to be there, string has no dimension
+    const char *data   = "double"; // Other types exist - hardcoding for now
+    buffer_write(h5->buf, &msg_num,   2);
+    size_t size_loc = buffer_tell(h5->buf);
+    buffer_write(h5->buf, &size,      2);
+    buffer_write(h5->buf, &fnr,       4);
+    size_t data_beg = buffer_tell(h5->buf);
+    buffer_write(h5->buf, &ver,       1);
+    buffer_write(h5->buf, &RES_8,     1);
+    buffer_write(h5->buf, &name_sz,   2);
+    buffer_write(h5->buf, &type_sz,   2);
+    buffer_write(h5->buf, &space_sz,  2);
+    buffer_write(h5->buf, name,       name_sz);
+    buffer_write(h5->buf, &RES_8,     1);
+    buffer_8byte_align(h5->buf);
+    buffer_write(h5->buf, &type_type, 4);
+    buffer_write(h5->buf, &type_len,  4);
+    buffer_write(h5->buf, &space,     8);
+    buffer_write(h5->buf, data,       type_len);
+    buffer_8byte_align(h5->buf);
+    size = buffer_tell(h5->buf) - data_beg;
+    buffer_seek(h5->buf, size_loc);
+    buffer_write(h5->buf, &size, 2);
+    buffer_seek_end(h5->buf);
+}
 
 void
 hdf5_begin(struct hdf5 *h5, const char *name, enum mat_type type)
 {
     // write name to heap and store info
     size_t len_name = strlen(name);
-    struct var *v = var_create(len_name, h5->root_group->heap_p);
+    size_t heap_off = h5->root_group->heap_p - h5->root_group->heap_begin - 0x20;
+    struct var *v = var_create(len_name, heap_off);
     if (len_name > (h5->root_group->heap_end - h5->root_group->heap_p + 1)) {
         size_t amt = h5->root_group->heap_end - h5->root_group->heap_begin - 0x20;
         file_shift(h5->out, h5->root_group->heap_end, amt);
@@ -404,14 +509,102 @@ hdf5_begin(struct hdf5 *h5, const char *name, enum mat_type type)
     while ((h5->root_group->heap_p % 8) != 0) {
         fwrite(&RES_8, 1, 1, h5->out);
         h5->root_group->heap_p++;
-    }
-    v->obj_loc = 0x28*(h5->root_group->count - 1) + h5->root_group->heap_end + 0x08;
+    }    
+    v->obj_loc  = 0x28*(h5->root_group->count - 1) + h5->root_group->heap_end + 0x08;
+    v->mem_size = SIZES[type];
 
     // Begin writing object to buffer
     hdf5_buffer_fill_object_header(h5, 5, UNDEF);
     hdf5_buffer_message_0x05(h5);
-    // TODO: hdf5_buffer_message_0x03 - need h5, type
-    // TODO: hdf5_buffer_message_0x0C - need h5, type
+    hdf5_buffer_message_0x03(h5, type);
+    hdf5_buffer_message_0x0C(h5, type);
+}
+
+void
+hdf5_vdims(struct hdf5 *h5, size_t ndims, uint64_t *dims)
+{
+    if (ndims > 255) {
+        // some error about exceeding max number of dimensions
+        return;
+    }
+    h5->root_group->var[h5->root_group->count-1]->nmemb = 1;
+    uint16_t msg_num  = 0x0001;
+    uint16_t size     = 0x0008 + (2 * 0x0008 * (uint16_t)ndims);
+    uint32_t flag_res = 0x00000000;
+    uint8_t ds_ver    = 0x01;
+    uint8_t dimen     = (uint8_t)ndims;
+    uint8_t flags     = 0x01; // First bit if max dims present, second bit if permutation indices
+    buffer_write(h5->buf, &msg_num,  2);
+    buffer_write(h5->buf, &size,     2);
+    buffer_write(h5->buf, &flag_res, 4);
+    buffer_write(h5->buf, &ds_ver,   1);
+    buffer_write(h5->buf, &dimen,    1);
+    buffer_write(h5->buf, &flags,    1);
+    buffer_write(h5->buf, &RES_8,    1);
+    buffer_write(h5->buf, &RES_32,   4);
+    for (size_t i = 0; i < ndims; i++) {
+        buffer_write(h5->buf, &(dims[i]), 8);
+        h5->root_group->var[h5->root_group->count-1]->nmemb *= dims[i];
+    }
+    for (size_t i = 0; i < ndims; i++)
+        buffer_write(h5->buf, &(dims[i]), 8);
+}
+
+void
+hdf5_dims(struct hdf5 *h5, size_t ndims, ...)
+{
+    va_list ap;
+    va_start(ap, ndims);
+    uint64_t dims[ndims];
+    for (size_t i = 0; i < ndims; i++)
+        dims[i] = va_arg(ap, uint64_t);
+    va_end(ap);
+    hdf5_vdims(h5, ndims, dims);
+}
+
+void
+hdf5_data(struct hdf5 *h5, const void *data)
+{
+    size_t num = h5->root_group->var[h5->root_group->count-1]->nmemb;
+    size_t mem_size   = h5->root_group->var[h5->root_group->count-1]->mem_size;
+    uint16_t msg_num  = 0x0008;
+    uint16_t size     = (num * mem_size) + 0x0008;
+    uint32_t flag_res = 0x00000000;
+    uint8_t ver       = 0x03;
+    uint8_t class     = 0x00;
+    uint16_t d_size   = size - 0x0008;
+    buffer_write(h5->buf, &msg_num,  2);
+    buffer_write(h5->buf, &size,     2);
+    buffer_write(h5->buf, &flag_res, 4);
+    buffer_write(h5->buf, &ver,      1);
+    buffer_write(h5->buf, &class,    1);
+    buffer_write(h5->buf, &d_size,   2);
+    buffer_write(h5->buf, data, d_size);
+    buffer_8byte_align(h5->buf);
+}
+
+void
+hdf5_end(struct hdf5 *h5)
+{
+    buffer_seek_end(h5->buf);
+    size_t buf_end = buffer_tell(h5->buf);
+    buffer_seek(h5->buf, 8);
+    size_t size     = buf_end - 0x10;
+    buffer_write(h5->buf, &size, 8);
+    size_t heap_off = h5->root_group->var[h5->root_group->count-1]->heap_off;
+    size_t this_loc = h5->root_group->var[h5->root_group->count-1]->obj_loc;
+    uint32_t cache  = 0x00000000;
+    uint64_t RES_64 = 0x0000000000000000;
+    fseek(h5->out, 0, SEEK_END);
+    size_t obj_start = ftell(h5->out) - h5->super_block.file_offset;
+    buffer_flush(h5->buf, h5);
+    fseek(h5->out, this_loc, SEEK_SET);
+    fwrite(&heap_off,  8, 1, h5->out);
+    fwrite(&obj_start, 8, 1, h5->out);
+    fwrite(&cache,     4, 1, h5->out);
+    fwrite(&RES_32,    4, 1, h5->out);
+    fwrite(&RES_64,    8, 1, h5->out);
+    fwrite(&RES_64,    8, 1, h5->out);
 }
 
 int main (void)
@@ -424,6 +617,12 @@ int main (void)
     hdf5_begin(h5, "test_a", miDOUBLE);
     hdf5_dims(h5, 2, 1, 1);
     hdf5_data(h5, &test_a);
+    hdf5_end(h5);
+
+    double test_b[] = {1.0, 4.0, 2.0, 5.0, 3.0, 6.0};
+    hdf5_begin(h5, "testy_test", miDOUBLE);
+    hdf5_dims(h5, 2, 2, 3);
+    hdf5_data(h5, test_b);
     hdf5_end(h5);
     
     hdf5_destroy(&h5);
