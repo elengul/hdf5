@@ -20,6 +20,88 @@ struct hdf5 {
     struct group *root_group;
 };
 
+struct var {
+    size_t len_name, heap_off, obj_loc, nmemb, mem_size;
+};
+
+struct group {
+    uint64_t b_tree_begin;
+    uint64_t heap_begin, heap_end, heap_p;
+    size_t size, count;
+    struct var **var;
+};
+
+struct b_tree_node {
+    size_t count, size;
+    uint64_t *key;
+    uint8_t is_leaf;
+    union {
+        struct b_tree_node **child;
+        size_t snod_loc;
+    };
+};
+
+struct b_tree {
+    struct b_tree_node *root;
+    size_t int_k;
+};
+
+struct b_tree_node *
+b_tree_node_create(size_t int_k, uint8_t is_leaf)
+{
+    struct b_tree_node *out = malloc(sizeof(*out));
+    out->count   = 0;
+    out->size    = int_k;
+    out->is_leaf = is_leaf;
+    size_t total = 1 + 2*out->size;
+    out->key     = malloc(total * sizeof(out->key[0]));
+    out->key[0]  = 0;
+    out->child   = NULL;
+    return out;
+}
+
+void
+b_tree_node_destroy(struct b_tree_node **B)
+{
+    struct b_tree_node *b = *B;
+    if (!(b->is_leaf) && b->child) {
+        for (size_t i = 0; i < b->count; i++)
+            if (b->child[i])
+                b_tree_node_destroy(&b->child[i]);
+        free(b->child);
+    };
+    free(b->key);
+    free(*B);
+    *B = NULL;
+}
+
+struct b_tree *
+b_tree_create(size_t int_k)
+{
+    struct b_tree *out = malloc(sizeof(*out));
+    out->int_k = int_k;
+    out->root  = b_tree_node_create(int_k, 1);
+    return out;
+}
+
+void
+b_tree_destroy(struct b_tree **b)
+{
+    b_tree_node_destroy((*b)->root);
+    free(*b);
+    *b = NULL;
+}
+
+void
+b_tree_insert(struct b_tree *b, size_t k)
+{
+    if (b->root = NULL) {
+        b->root = b_tree_node_create(b->int_k, 1);
+        b->root->key[1] = k;
+        b->root->count  = 1;
+    }
+}
+
 struct buffer *
 buffer_create(void)
 {
@@ -107,6 +189,68 @@ size_t
 buffer_tell(struct buffer *b)
 {
     return b->p;
+}
+
+struct var *
+var_create(size_t len, size_t off)
+{
+    struct var *out = malloc(sizeof(*out));
+    out->len_name = len;
+    out->heap_off = off;
+    return out;
+}
+
+void
+var_destroy(struct var **v)
+{
+    free(*v);
+    *v = NULL;
+}
+
+void
+group_load(struct group *g, unsigned type)
+{
+    switch (type) {
+    default: //case 0:
+        g->b_tree_begin = ROOT_BTREE;
+        g->heap_begin   = ROOT_HEAP;
+        g->heap_end     = ROOT_HEAP + 0x78;
+        g->heap_p       = ROOT_HEAP + 0x28;
+        break;
+    }
+}
+
+struct group *
+group_create(unsigned type)
+{
+    // type will determine components of group
+    struct group *out = malloc(sizeof(*out));
+    group_load(out, type);
+    out->size  = 4;
+    out->count = 0;
+    out->var   = malloc(out->size * sizeof(out->var[0]));
+    return out;
+}
+
+void
+group_destroy(struct group **g)
+{
+    for (size_t i = 0; i < (*g)->count; i++)
+        var_destroy(&(*g)->var[i]);
+    free((*g)->var);
+    free(*g);
+    *g = NULL;
+}
+
+void
+group_var_push(struct group *g, struct var *v)
+{
+    if (g->count == g->size) {
+        g->size *= 2;
+        g->var   = realloc(g->var, g->size * sizeof(g->var[0]));
+    }
+    g->var[g->count] = v;
+    g->count++;
 }
 
 size_t
@@ -217,79 +361,6 @@ hdf5_create(FILE *outfile)
     return out;
 }
 
-struct var {
-    size_t len_name, heap_off, obj_loc, nmemb, mem_size;
-};
-
-struct group {
-    uint64_t b_tree_begin;
-    uint64_t heap_begin, heap_end, heap_p;
-    size_t size, count;
-    struct var **var;
-};
-
-struct var *
-var_create(size_t len, size_t off)
-{
-    struct var *out = malloc(sizeof(*out));
-    out->len_name = len;
-    out->heap_off = off;
-    return out;
-}
-
-void
-var_destroy(struct var **v)
-{
-    free(*v);
-    *v = NULL;
-}
-
-void
-group_load(struct group *g, unsigned type)
-{
-    switch (type) {
-    default: //case 0:
-        g->b_tree_begin = ROOT_BTREE;
-        g->heap_begin   = ROOT_HEAP;
-        g->heap_end     = ROOT_HEAP + 0x78;
-        g->heap_p       = ROOT_HEAP + 0x28;
-        break;
-    }
-}
-
-struct group *
-group_create(unsigned type)
-{
-    // type will determine components of group
-    struct group *out = malloc(sizeof(*out));
-    group_load(out, type);
-    out->size  = 4;
-    out->count = 0;
-    out->var   = malloc(out->size * sizeof(out->var[0]));
-    return out;
-}
-
-void
-group_destroy(struct group **g)
-{
-    for (size_t i = 0; i < (*g)->count; i++)
-        var_destroy(&(*g)->var[i]);
-    free((*g)->var);
-    free(*g);
-    *g = NULL;
-}
-
-void
-group_var_push(struct group *g, struct var *v)
-{
-    if (g->count == g->size) {
-        g->size *= 2;
-        g->var   = realloc(g->var, g->size * sizeof(g->var[0]));
-    }
-    g->var[g->count] = v;
-    g->count++;
-}
-
 void
 hdf5_buffer_fill_object_header(struct hdf5 *h5, uint16_t num_msg, uint64_t hdr_size)
 {
@@ -370,7 +441,11 @@ hdf5_destroy(struct hdf5 **H)
     struct hdf5 *h5 = *H;
     if (buffer_tell(h5->buf) > 0)
         buffer_flush(h5->buf, h5);
-    fseek(h5->out, h5->root_group->heap_end+6, SEEK_SET);
+    fseek(h5->out, h5->root_group->heap_begin+0x10, SEEK_SET);
+    size_t size_data = h5->root_group->heap_p - h5->root_group->heap_begin - 0x20;
+    fwrite(&size_data, 8, 1, h5->out);
+    fseek(h5->out, 0x8 + size_data, SEEK_CUR);
+    
     uint16_t num_vars = h5->root_group->count;
     fwrite(&num_vars, 2, 1, h5->out);
     fseek(h5->out, 0, SEEK_END);
